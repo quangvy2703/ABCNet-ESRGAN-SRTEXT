@@ -125,11 +125,13 @@ class SimpleTrainer(TrainerBase):
         self.optimizer = optimizer
 
         # GAN model
+        self.checkpoint_interval = 5000
         self.sample_interval = 100
         self.batches_done = 0
         self.warmup_batches = 500
         self.lambda_adv = 5e-3
         self.lambda_pixel = 1e-2
+        self.lambda_detection = 1e-2
         self.discriminator = discriminator
         self.generator = generator
         self.feature_extractor = feature_extractor
@@ -150,6 +152,7 @@ class SimpleTrainer(TrainerBase):
         """
 
         data = next(self._data_loader_iter)
+        print(data)
         data_time = time.perf_counter() - start
 
         """
@@ -203,7 +206,7 @@ class SimpleTrainer(TrainerBase):
         loss_content = self.criterion_content(gen_features, real_features)
 
         # Total generator loss
-        loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel + 1e-2 * detection_losses
+        loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel + self.lambda_detection * detection_losses
 
         loss_G.backward()
         self.optimizer_G.step()
@@ -233,7 +236,7 @@ class SimpleTrainer(TrainerBase):
         # --------------
 
         print(
-            "[Batch %d] [D loss: %f] [G loss: %f, content: %f, adv: %f, pixel: %f]"
+                "[Batch %d] [D loss: %f] [G loss: %f, content: %f, adv: %f, pixel: %f, detection: %f]"
             % (
                 iter,
                 loss_D.item(),
@@ -241,6 +244,7 @@ class SimpleTrainer(TrainerBase):
                 loss_content.item(),
                 loss_GAN.item(),
                 loss_pixel.item(),
+                detection_losses.item()
             )
         )
 

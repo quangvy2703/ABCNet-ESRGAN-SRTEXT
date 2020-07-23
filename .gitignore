@@ -48,7 +48,7 @@ dist/
 /debug
 /weights
 /export
-/datasets
+/datasets/CTW1500
 eval.sh
 
 demo/performance.py

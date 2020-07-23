@@ -125,10 +125,11 @@ class SimpleTrainer(TrainerBase):
         self.optimizer = optimizer
 
         # GAN model
+
         self.checkpoint_interval = 5000
         self.sample_interval = 100
         self.batches_done = 0
-        self.warmup_batches = 500
+        self.warmup_batches = 1000
         self.lambda_adv = 5e-3
         self.lambda_pixel = 1e-2
         self.lambda_detection = 1e-2
@@ -146,24 +147,23 @@ class SimpleTrainer(TrainerBase):
         Implement the standard training logic described above.
         """
         assert self.model.training, "[SimpleTrainer] model was changed to eval mode!"
+        # self.model.eval()
         start = time.perf_counter()
         """
         If you want to do something with the data, you can wrap the dataloader.
         """
 
         data = next(self._data_loader_iter)
-        print(data)
         data_time = time.perf_counter() - start
-
         """
         If you want to do something with the losses, you can wrap the model.
         """
         loss_dict = self.model(data)
         detection_losses = loss_dict['loss_fcos_cls'] + loss_dict['loss_fcos_loc'] + loss_dict['loss_fcos_ctr'] + \
                  loss_dict['loss_fcos_bezier']
+        # detection_losses = sum(loss_dict.values())
 
         #########################################
-        self.batches_done += 1
         # Tranform low-resolution and high-resolution images
         # from datetime import datetime
         # now = datetime.now()
@@ -206,6 +206,7 @@ class SimpleTrainer(TrainerBase):
         loss_content = self.criterion_content(gen_features, real_features)
 
         # Total generator loss
+
         loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel + self.lambda_detection * detection_losses
 
         loss_G.backward()
@@ -230,7 +231,6 @@ class SimpleTrainer(TrainerBase):
         loss_D.backward()
         self.optimizer_D.step()
 
-
         # --------------
         #  Log Progress
         # --------------
@@ -251,7 +251,7 @@ class SimpleTrainer(TrainerBase):
         if self.batches_done % self.sample_interval == 0:
             # Save image grid with upsampled inputs and ESRGAN outputs
             imgs_lr = nn.functional.interpolate(lr_img, scale_factor=4)
-            img_grid = self.esrgan_datasets.denormalize(torch.cat((imgs_lr, gen_hr), -1))
+            img_grid = esrgan_datasets.denormalize(torch.cat((imgs_lr, gen_hr), -1))
             save_image(img_grid, "images/training/%d.png" % self.batches_done, nrow=1, normalize=False)
 
         if self.batches_done % self.checkpoint_interval == 0:
@@ -285,7 +285,12 @@ class SimpleTrainer(TrainerBase):
         wrap the optimizer with your custom `step()` method. But it is
         suboptimal as explained in https://arxiv.org/abs/2006.15704 Sec 3.2.4
         """
-        self.optimizer.step()
+        # self.optimizer.step()
+        self.batches_done += 1
+        # del loss_D, loss_fake, loss_real
+        # del loss_dict, gen_hr, loss_pixel
+        # del pred_real, pred_fake
+        # del loss_GAN, gen_features, real_features, loss_content, loss_G
 
     def _detect_anomaly(self, losses, loss_dict):
         if not torch.isfinite(losses).all():
@@ -380,13 +385,16 @@ class DefaultTrainer(SimpleTrainer):
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
+        for param in model.parameters():
+            param.requires_grad = False
+
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
         # For training, wrap with DDP. But don't need this for inference.
         if comm.get_world_size() > 1:
             model = DistributedDataParallel(
-                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
+                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False, find_unused_parameters=True
             )
         super().__init__(model, data_loader, optimizer)
 
@@ -699,6 +707,8 @@ class Trainer(DefaultTrainer):
         """
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
+        for param in model.parameters():
+            param.requires_grad = False
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
@@ -758,25 +768,6 @@ class Trainer(DefaultTrainer):
             for self.iter in range(start_iter, max_iter):
                 self.before_step()
                 self.run_step(self.iter)
-                self.after_step()
-            self.after_train()
-
-    def train_loop_mine(self, start_iter: int, max_iter: int):
-        """
-        Args:
-            start_iter, max_iter (int): See docs above
-        """
-        logger = logging.getLogger("adet.trainer")
-        logger.info("Starting training from iteration {}".format(start_iter))
-
-        self.iter = self.start_iter = start_iter
-        self.max_iter = max_iter
-
-        with EventStorage(start_iter) as self.storage:
-            self.before_train()
-            for self.iter in range(start_iter, max_iter):
-                self.before_step()
-                self.run_step()
                 self.after_step()
             self.after_train()
 

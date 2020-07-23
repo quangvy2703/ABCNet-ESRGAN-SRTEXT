@@ -385,9 +385,9 @@ class DefaultTrainer(SimpleTrainer):
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
+        ## Freeze ABCNet parameters
         for param in model.parameters():
             param.requires_grad = False
-
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
@@ -707,8 +707,6 @@ class Trainer(DefaultTrainer):
         """
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
-        for param in model.parameters():
-            param.requires_grad = False
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 

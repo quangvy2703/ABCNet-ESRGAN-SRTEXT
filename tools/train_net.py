@@ -27,6 +27,7 @@ import contextlib
 from torch.autograd import Variable
 import torch.nn as nn
 from torchvision.utils import save_image, make_grid
+import matplotlib.pyplot as plt
 
 import detectron2.utils.comm as comm
 from detectron2.data import MetadataCatalog, build_detection_train_loader
@@ -69,6 +70,9 @@ from adet.modeling.esrgan import models as esrgan_model
 from adet.modeling.esrgan import datasets as esrgan_datasets
 from fvcore.nn.precise_bn import get_bn_modules
 
+
+from graphviz import Digraph
+
 try:
     _nullcontext = contextlib.nullcontext  # python 3.7+
 except AttributeError:
@@ -79,7 +83,7 @@ except AttributeError:
 
 Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.Tensor
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-hr_shape = (256, 256)
+hr_shape = (480, 480)
 
 
 class SimpleTrainer(TrainerBase):
@@ -125,14 +129,13 @@ class SimpleTrainer(TrainerBase):
         self.optimizer = optimizer
 
         # GAN model
-
         self.checkpoint_interval = 5000
         self.sample_interval = 100
         self.batches_done = 0
-        self.warmup_batches = 1000
+        self.warmup_batches = 100
         self.lambda_adv = 5e-3
         self.lambda_pixel = 1e-2
-        self.lambda_detection = 1e-2
+        self.lambda_ABC = 1e-2
         self.discriminator = discriminator
         self.generator = generator
         self.feature_extractor = feature_extractor
@@ -147,7 +150,6 @@ class SimpleTrainer(TrainerBase):
         Implement the standard training logic described above.
         """
         assert self.model.training, "[SimpleTrainer] model was changed to eval mode!"
-        # self.model.eval()
         start = time.perf_counter()
         """
         If you want to do something with the data, you can wrap the dataloader.
@@ -158,95 +160,111 @@ class SimpleTrainer(TrainerBase):
         """
         If you want to do something with the losses, you can wrap the model.
         """
-        loss_dict = self.model(data)
-        detection_losses = loss_dict['loss_fcos_cls'] + loss_dict['loss_fcos_loc'] + loss_dict['loss_fcos_ctr'] + \
-                 loss_dict['loss_fcos_bezier']
-        # detection_losses = sum(loss_dict.values())
 
         #########################################
         # Tranform low-resolution and high-resolution images
-        # from datetime import datetime
-        # now = datetime.now()
-        img = [_data['image'] for _data in data]
-        lr_img = [esrgan_datasets.lr_transform(_img) for _img in img]
-        hr_img = [esrgan_datasets.hr_transform(_img) for _img in img]
-        lr_img = torch.stack(lr_img).to(device)
-        hr_img = torch.stack(hr_img).to(device)
+        #########################################
 
-        # Adversarial ground truths
-        valid = Variable(Tensor(np.ones((lr_img.size(0), *self.discriminator.output_shape))), requires_grad=False)
-        fake = Variable(Tensor(np.zeros((lr_img.size(0), *self.discriminator.output_shape))), requires_grad=False)
+        imgs = [_data['image'] for _data in data]
+        for idx, img in enumerate(imgs):
+            shards = esrgan_datasets.crop_into_boxes(img)
+            original_size = (img.shape[2], img.shape[1])
 
-        self.optimizer_G.zero_grad()
+            lr_img = [esrgan_datasets.lr_transform(_img) for _img in shards]
+            hr_img = [esrgan_datasets.hr_transform(_img) for _img in shards]
+            lr_img = torch.stack(lr_img).to(device)
+            hr_img = torch.stack(hr_img).to(device)
 
-        # Generate a high resolution image from low resolution input
-        gen_hr = self.generator(lr_img)
+            # Adversarial ground truths
+            valid = Variable(Tensor(np.ones((lr_img.size(0), *self.discriminator.output_shape))), requires_grad=False)
+            fake = Variable(Tensor(np.zeros((lr_img.size(0), *self.discriminator.output_shape))), requires_grad=False)
 
-        # Measure pixel-wise loss against ground truth
-        loss_pixel = self.criterion_pixel(gen_hr, hr_img)
-        if self.batches_done < self.warmup_batches:
-            # Warm-up (pixel-wise loss only)
-            loss_pixel.backward()
+            self.optimizer_G.zero_grad()
+
+            # Generate a high resolution image from low resolution input
+            gen_hr = self.generator(lr_img)
+            # print(gen_hr.shape)
+
+            # Measure pixel-wise loss against ground truth
+            loss_pixel = self.criterion_pixel(gen_hr, hr_img)
+            if self.batches_done < self.warmup_batches:
+                # Warm-up (pixel-wise loss only)
+                loss_pixel.backward()
+                self.optimizer_G.step()
+                print(
+                    "[Batch %d] [G pixel: %f]" % (iter, loss_pixel.item())
+                )
+                self.batches_done += 1
+                return
+
+            # Extract validity predictions from discriminator
+            pred_real = self.discriminator(hr_img).detach()
+            pred_fake = self.discriminator(gen_hr)
+
+            # Adversarial loss (relativistic average GAN)
+            loss_GAN = self.criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True), valid)
+
+            # Content loss
+            gen_features = self.feature_extractor(gen_hr)
+            real_features = self.feature_extractor(hr_img).detach()
+            loss_content = self.criterion_content(gen_features, real_features)
+
+            # Total generator loss
+
+            data[idx]['image'] = esrgan_datasets.merge_into_image(gen_hr, original_size)
+            if idx == len(imgs) - 1:
+                loss_dict = self.model(data)
+                loss_ABC = sum(loss_dict.values())
+                loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel\
+                         + self.lambda_ABC * loss_ABC
+            else:
+                loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel
+            if idx == len(imgs) - 1:
+                loss_G.backward()
+            else:
+                loss_G.backward(retain_graph=True)
             self.optimizer_G.step()
-            print(
-                "[Batch %d] [G pixel: %f]" % (iter, loss_pixel.item())
-            )
-            return
 
-        # Extract validity predictions from discriminator
-        pred_real = self.discriminator(hr_img).detach()
-        pred_fake = self.discriminator(gen_hr)
+            #
+            # # ---------------------
+            # #  Train Discriminator
+            # # ---------------------
+            #
+            self.optimizer_D.zero_grad()
 
-        # Adversarial loss (relativistic average GAN)
-        loss_GAN = self.criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True), valid)
+            pred_real = self.discriminator(hr_img)
+            pred_fake = self.discriminator(gen_hr.detach())
 
-        # Content loss
-        gen_features = self.feature_extractor(gen_hr)
-        real_features = self.feature_extractor(hr_img).detach()
-        loss_content = self.criterion_content(gen_features, real_features)
+            # Adversarial loss for real and fake images (relativistic average GAN)
+            loss_real = self.criterion_GAN(pred_real - pred_fake.mean(0, keepdim=True), valid)
+            loss_fake = self.criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True), fake)
 
-        # Total generator loss
+            # Total loss
+            loss_D = (loss_real + loss_fake) / 2
 
-        loss_G = loss_content + self.lambda_adv * loss_GAN + self.lambda_pixel * loss_pixel + self.lambda_detection * detection_losses
+            loss_D.backward()
+            self.optimizer_D.step()
 
-        loss_G.backward()
-        self.optimizer_G.step()
+            # --------------
+            #  Log Progress
+            # --------------
+            if idx == len(imgs) - 1:
+                print(
+                    "[Batch %d] [D loss: %f] [G loss: %f, content: %f, adv: %f, pixel: %f, ABC loss: %f]"
+                    % (
+                        iter,
+                        loss_D.item(),
+                        loss_G.item(),
+                        loss_content.item(),
+                        loss_GAN.item(),
+                        loss_pixel.item(),
+                        loss_ABC.item()
+                    )
+                )
+            self.batches_done += 1
 
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
+        # self.optimizer_G.step()
 
-        self.optimizer_D.zero_grad()
-
-        pred_real = self.discriminator(hr_img)
-        pred_fake = self.discriminator(gen_hr.detach())
-
-        # Adversarial loss for real and fake images (relativistic average GAN)
-        loss_real = self.criterion_GAN(pred_real - pred_fake.mean(0, keepdim=True), valid)
-        loss_fake = self.criterion_GAN(pred_fake - pred_real.mean(0, keepdim=True), fake)
-
-        # Total loss
-        loss_D = (loss_real + loss_fake) / 2
-
-        loss_D.backward()
-        self.optimizer_D.step()
-
-        # --------------
-        #  Log Progress
-        # --------------
-
-        print(
-                "[Batch %d] [D loss: %f] [G loss: %f, content: %f, adv: %f, pixel: %f, detection: %f]"
-            % (
-                iter,
-                loss_D.item(),
-                loss_G.item(),
-                loss_content.item(),
-                loss_GAN.item(),
-                loss_pixel.item(),
-                detection_losses.item()
-            )
-        )
 
         if self.batches_done % self.sample_interval == 0:
             # Save image grid with upsampled inputs and ESRGAN outputs
@@ -280,17 +298,13 @@ class SimpleTrainer(TrainerBase):
             self._write_metrics(metrics_dict)
             self._detect_anomaly(detection_losses, loss_dict)
 
-        """
-        If you need gradient clipping/scaling or other processing, you can
-        wrap the optimizer with your custom `step()` method. But it is
-        suboptimal as explained in https://arxiv.org/abs/2006.15704 Sec 3.2.4
-        """
-        # self.optimizer.step()
-        self.batches_done += 1
-        # del loss_D, loss_fake, loss_real
-        # del loss_dict, gen_hr, loss_pixel
-        # del pred_real, pred_fake
-        # del loss_GAN, gen_features, real_features, loss_content, loss_G
+            """
+            If you need gradient clipping/scaling or other processing, you can
+            wrap the optimizer with your custom `step()` method. But it is
+            suboptimal as explained in https://arxiv.org/abs/2006.15704 Sec 3.2.4
+            """
+
+
 
     def _detect_anomaly(self, losses, loss_dict):
         if not torch.isfinite(losses).all():
@@ -760,14 +774,17 @@ class Trainer(DefaultTrainer):
 
         self.iter = self.start_iter = start_iter
         self.max_iter = max_iter
-
+        _len = []
         with EventStorage(start_iter) as self.storage:
             self.before_train()
             for self.iter in range(start_iter, max_iter):
                 self.before_step()
                 self.run_step(self.iter)
+                # self.run_step_recog(self.iter)
                 self.after_step()
             self.after_train()
+
+
 
     def train(self):
         """
